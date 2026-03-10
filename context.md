@@ -10,7 +10,8 @@
 | 4 | `step4_pretrain.sh` | TODO | Pretrain ResEncL, Primus, PrimusV2 on additional data |
 | 5 | `step5_train_5fold.sh` | TODO | Train 5-fold CV for each model (fine-tune from pretrained) |
 | 6 | `step6_generate_oof.sh` | TODO | Generate OOF predictions for each model |
-| 7-? | TBD | TODO | Future steps (2nd stage, deformnet, submission) |
+| 7 | `step7_train_2nd_stage.sh` | TODO | Train 2nd stage 5-fold (image + 3 OOF channels) |
+| 8-? | TBD | TODO | Future steps (generate 2nd stage OOF, 3rd+ stages, deformnet, submission) |
 
 ## Key Architecture
 - **3 first-stage models**: ResEncL (residual encoder UNet), Primus, PrimusV2
@@ -35,6 +36,7 @@ cv_outputs_primus_v2/
 1st_stage_cache/             # ResEncL OOF probabilities
 Primus_1st_stage_cache/      # Primus OOF probabilities
 PrimusV2_1st_stage_cache/    # PrimusV2 OOF probabilities
+cv_outputs_2nd_stage/        # 2nd stage 5-fold outputs
 ```
 
 ## Model Configs (from train_cv.py defaults + eval script)

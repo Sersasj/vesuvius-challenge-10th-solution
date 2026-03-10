@@ -8,7 +8,7 @@ import numpy as np
 from pathlib import Path
 
 from .residual_unet import create_residual_unet
-from ..losses import DiceLoss, SurfaceDiceLoss, TopKCrossEntropyLoss, SkeletonRecallLoss
+from ..losses import DiceLoss, SurfaceDiceLoss, SkeletonRecallLoss
 from ..utils.ema import EMA
 
 
@@ -65,8 +65,7 @@ class SegmentationModule(pl.LightningModule):
             self.ema = EMA(self.model, decay=ema_decay, warmup=ema_warmup)
 
         # Loss functions
-        self.ce_loss = (TopKCrossEntropyLoss(top_k_percent=ce_top_k, ignore_index=ignore_index)
-                        if ce_top_k < 1.0 else nn.CrossEntropyLoss(ignore_index=ignore_index))
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index)
         self.dice_loss = DiceLoss(smooth=1e-5, ignore_index=ignore_index)
         self.surface_dice_loss = SurfaceDiceLoss(
             ignore_label=ignore_index, soft_skel_iterations=surface_dice_iterations, smooth=1.0

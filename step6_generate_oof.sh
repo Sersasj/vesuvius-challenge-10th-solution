@@ -2,6 +2,8 @@
 # Step 6: Generate 1st-stage OOF predictions for each model
 set -e
 
+export PYTHONPATH="${PYTHONPATH}:$(pwd)"
+
 COMMON="--num_stages 1 --folds all"
 
 # ResEncL OOF
