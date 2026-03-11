@@ -1,0 +1,46 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.eggs/
+dist/
+build/
+.eggs/
+
+# Data / model artifacts (large files)
+*.npy
+*.ckpt
+*.pt
+*.pth
+*.tif
+*.tiff
+
+# Directories with data/outputs
+train_images/
+train_labels/
+train_images_npy/
+train_labels_npy/
+train_skeletons_npy/
+additional_data/
+pretrained_checkpoints/
+cv_outputs_*/
+*_stage_cache/
+1st_stage_cache/
+Primus_1st_stage_cache/
+PrimusV2_1st_stage_cache/
+
+# WandB
+wandb/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.log
