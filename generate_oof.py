@@ -29,7 +29,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from src.models.lightning_module import SegmentationModule
-from src_2nd_stage.models.lightning_module import SegmentationModule as SegmentationModule2ndStage
+from src_2nd_4th_stages.models.lightning_module import SegmentationModule as SegmentationModule2ndStage
 from src.utils.metric import load_volume
 
 # Tom-style DeformNet (DeformDynUnetV2 from tom_submission_stuff)
@@ -40,8 +40,8 @@ _deformNet3d = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_deformNet3d)
 DeformDynUnetV2 = _deformNet3d.DeformDynUnetV2
 
-# Sergio-style DeformNet (src_3nd_stage Lightning module)
-from src_3nd_stage.models.lightning_module import SegmentationModule as DeformSegModule
+# Sergio-style DeformNet (src_deformnet_stage Lightning module)
+from src_deformnet_stage.models.lightning_module import SegmentationModule as DeformSegModule
 
 
 def _load_model_with_ema(module_class, ckpt_path: str, device: torch.device):
@@ -147,7 +147,7 @@ CHECKPOINT_PATHS_5TH_STAGE = {
 # Each entry can be:
 #   "path/to/ckpt"             – plain string, defaults to "tom" loader (DeformDynUnetV2)
 #   ("path/to/ckpt", "tom")    – Tom's DeformDynUnetV2 (tom_submission_stuff)
-#   ("path/to/ckpt", "sergio") – Sergio's DeformSegModule (src_3nd_stage Lightning module)
+#   ("path/to/ckpt", "sergio") – Sergio's DeformSegModule (src_deformnet_stage Lightning module)
 CHECKPOINT_PATHS_6TH_STAGE = {
     "fold0": [
         ("deformSergio/fold-0-best-epoch=74-val_dice=0.5980-val_loss=0.4271.ckpt", "sergio"),
@@ -179,7 +179,7 @@ DEFORM_CFG = OmegaConf.create({
     "max_topo_offset": 1.0,
 })
 
-# DeformNet hyperparameters – Sergio loader (src_3nd_stage DeformSegModule)
+# DeformNet hyperparameters – Sergio loader (src_deformnet_stage DeformSegModule)
 DEFORM_KERNEL_SIZE_SERGIO = 3
 DEFORM_SIGMA_SERGIO = 5
 
@@ -247,9 +247,15 @@ CACHE_1ST_STAGE_ONLY: bool = True  # If True, skip 1st stage inference entirely
 # Set to a directory containing fold_0/, fold_1/, ... with {sample_id}_probs.npy files
 CACHE_2ND_STAGE_DIR: Optional[Path] = None  # Set to None to run inference
 
+# 3rd stage caching – load pre-computed 3rd stage OOF probabilities (skip 1st–3rd inference, run 4th stage)
+CACHE_3RD_STAGE_DIR: Optional[Path] = None  # Set to None to run inference
+
 # 4th stage caching – load pre-computed 4th stage OOF probabilities (skip 1st–4th inference, run only DeformNet)
 # Set to a directory with {sample_id}_probs.npy files (e.g. output of generate_oof_4_stage.py)
 CACHE_4TH_STAGE_DIR: Optional[Path] = None  # Set to None to run full pipeline
+
+# Generic: save the final stage's probability maps to this directory
+SAVE_FINAL_PROBS_DIR: Optional[Path] = None
 
 
 def parse_args():
@@ -310,7 +316,86 @@ def parse_args():
         help="Glob pattern for 1st stage checkpoints within --checkpoint_dir, e.g. 'fold_{fold}/best*.ckpt'. "
              "Use {fold} placeholder for fold index. Overrides CHECKPOINT_PATHS_1ST_STAGE."
     )
+    parser.add_argument(
+        "--checkpoint_dir_2nd",
+        type=str,
+        default=None,
+        help="Directory with fold_0/, fold_1/, ... containing 2nd stage checkpoints. Auto-discovers best*.ckpt."
+    )
+    parser.add_argument(
+        "--checkpoint_dir_3rd",
+        type=str,
+        default=None,
+        help="Directory with fold_0/, fold_1/, ... containing 3rd stage checkpoints."
+    )
+    parser.add_argument(
+        "--checkpoint_dir_4th",
+        type=str,
+        default=None,
+        help="Directory with fold_0/, fold_1/, ... containing 4th stage checkpoints."
+    )
+    parser.add_argument(
+        "--oof_dirs",
+        nargs="+",
+        default=None,
+        help="Override CACHE_1ST_STAGE_DIRS: list of OOF cache directories for 1st stage."
+    )
+    parser.add_argument(
+        "--cache_2nd_stage_dir",
+        type=str,
+        default=None,
+        help="Load pre-computed 2nd stage OOF probs from this directory (skip 1st+2nd stage inference)."
+    )
+    parser.add_argument(
+        "--cache_3rd_stage_dir",
+        type=str,
+        default=None,
+        help="Load pre-computed 3rd stage OOF probs from this directory (skip 1st–3rd stage inference)."
+    )
+    parser.add_argument(
+        "--save_probs_dir",
+        type=str,
+        default=None,
+        help="Save probability maps from the final stage to this directory."
+    )
     return parser.parse_args()
+
+
+def _discover_fold_checkpoints(base_dir: str, n_folds: int) -> dict:
+    """Auto-discover best checkpoints from fold_0/, fold_1/, ... directories."""
+    ckpt_dir = Path(base_dir)
+    result = {}
+    for fold_idx in range(n_folds):
+        fold_path = ckpt_dir / f"fold_{fold_idx}"
+        if not fold_path.exists():
+            continue
+        matches = sorted(fold_path.glob("best*.ckpt"))
+        if not matches:
+            matches = sorted(fold_path.glob("*.ckpt"))
+        if matches:
+            # Pick the one with highest val_dice if available
+            best = matches[-1]
+            for m in matches:
+                if "val_dice" in m.name:
+                    best = m
+                    break
+            result[f"fold{fold_idx}"] = [str(best)]
+            print(f"  fold{fold_idx}: {best.name}")
+        else:
+            print(f"  fold{fold_idx}: no checkpoints found in {fold_path}")
+    return result
+
+
+def _save_stage_probs(stage_num: int, fold_idx: int, sample_id: str, probs: np.ndarray):
+    """Save probability maps if SAVE_FINAL_PROBS_DIR is set and this is the target stage."""
+    if SAVE_FINAL_PROBS_DIR is None:
+        return
+    if NUM_STAGES != stage_num:
+        return
+    save_dir = Path(SAVE_FINAL_PROBS_DIR) / f"fold_{fold_idx}"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    np.save(save_dir / f"{sample_id}_probs.npy", probs.astype(np.float16))
+    print(f"      Saved stage {stage_num} probs to fold_{fold_idx}/{sample_id}_probs.npy")
 
 
 def get_folds(df: pd.DataFrame, n_folds: int = 5, seed: int = 42) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
@@ -513,7 +598,7 @@ def _predict_deformnet_sergio(
     device: torch.device,
     binarize_threshold: float,
 ) -> np.ndarray:
-    """Run Sergio-style DeformSegModule (src_3nd_stage) inference. Returns probability array (D,H,W) in [0,1]."""
+    """Run Sergio-style DeformSegModule (src_deformnet_stage) inference. Returns probability array (D,H,W) in [0,1]."""
     vol = torch.from_numpy(image_3d.astype(np.float32)).unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
     if vol.max() > 0:
         vol = vol / 255.0
@@ -940,6 +1025,107 @@ def evaluate_fold(
         return
 
     # ==================
+    # MODE 1c: Load cached 3rd stage OOF probs (run 4th stage only)
+    # ==================
+    if CACHE_3RD_STAGE_DIR is not None:
+        cache_3rd_dir = Path(CACHE_3RD_STAGE_DIR)
+        cache_3rd_fold_dir = cache_3rd_dir / f"fold_{fold_idx}"
+        print(f"CACHE_3RD_STAGE mode – loading from {cache_3rd_dir}, running 4th stage")
+
+        # Load 4th stage refinement model(s)
+        models_4th = _load_4th_stage_refinement_models(fold_key, device)
+        if not models_4th:
+            print(f"  No 4th stage models for {fold_key}, skipping")
+            return
+        patch_size_4th = PATCH_SIZE_4TH_STAGE or 128
+        roi_size_4th = (patch_size_4th, patch_size_4th, patch_size_4th)
+
+        val_df = val_df.head(max_samples)
+        print(f"Evaluating {len(val_df)} samples for fold {fold_idx}")
+
+        for sample_idx, (_, row) in enumerate(val_df.iterrows()):
+            sample_id = row["id"]
+            print(f"    [{sample_idx+1}/{len(val_df)}] Processing: {sample_id}")
+
+            # Load cached 3rd stage probs
+            probs = None
+            for try_dir in [cache_3rd_dir, cache_3rd_fold_dir]:
+                cache_file = try_dir / f"{sample_id}_probs.npy"
+                if cache_file.exists():
+                    probs = np.load(cache_file).astype(np.float32)
+                    break
+
+            if probs is None:
+                print(f"    SKIP: No cached 3rd stage probs for {sample_id}")
+                continue
+
+            pred = (probs > PRED_THRESHOLD_3RD_STAGE).astype(np.uint8)
+            del probs
+
+            image = np.asarray(load_volume(_find_file(IMAGE_DIR, sample_id)))
+
+            # 4TH STAGE: Refine with [image, 3rd stage mask]
+            image_normalized_4th = image.astype(np.float32) / 255.0
+            current_mask_4th = pred.astype(np.float32)
+
+            for iter_idx_4th in range(NUM_ITERATIONS_4TH_STAGE):
+                image_multichannel_4th = np.stack([image_normalized_4th, current_mask_4th], axis=0)
+
+                ensemble_probs_4th = None
+                for model_idx, model_4th in enumerate(models_4th):
+                    print(f"      4th stage model {model_idx+1}/{len(models_4th)} (iter {iter_idx_4th+1}/{NUM_ITERATIONS_4TH_STAGE})")
+
+                    x = torch.from_numpy(image_multichannel_4th).float().unsqueeze(0)
+                    torch.cuda.empty_cache()
+
+                    with torch.inference_mode(), torch.autocast(
+                        device_type="cuda" if device.type == "cuda" else "cpu",
+                        enabled=(device.type == "cuda")
+                    ):
+                        out = sliding_window_inference(
+                            inputs=x, roi_size=roi_size_4th, sw_batch_size=SW_BATCH_SIZE,
+                            predictor=model_4th, overlap=OVERLAP_4TH_STAGE, mode=SW_MODE,
+                            sigma_scale=SW_SIGMA_SCALE, padding_mode=PADDING_MODE, progress=False,
+                            sw_device=device, device='cpu'
+                        )
+
+                    del x
+                    torch.cuda.empty_cache()
+
+                    if isinstance(out, (list, tuple)):
+                        out = out[0]
+                    if out.shape[2:] != image.shape:
+                        out = F.interpolate(out, size=image.shape, mode='trilinear', align_corners=False)
+
+                    model_probs_4th = F.softmax(out, dim=1)[:, 1][0].detach().cpu().numpy()
+                    del out
+                    torch.cuda.empty_cache()
+
+                    if ensemble_probs_4th is None:
+                        ensemble_probs_4th = model_probs_4th / len(models_4th)
+                    else:
+                        ensemble_probs_4th += model_probs_4th / len(models_4th)
+                    del model_probs_4th
+                    torch.cuda.empty_cache()
+
+                del image_multichannel_4th
+                if iter_idx_4th == NUM_ITERATIONS_4TH_STAGE - 1:
+                    _save_stage_probs(4, fold_idx, sample_id, ensemble_probs_4th)
+                pred = (ensemble_probs_4th > PRED_THRESHOLD_4TH_STAGE).astype(np.uint8)
+                del ensemble_probs_4th
+                torch.cuda.empty_cache()
+
+                if iter_idx_4th < NUM_ITERATIONS_4TH_STAGE - 1:
+                    current_mask_4th = pred.astype(np.float32)
+
+            del image_normalized_4th, current_mask_4th, image, pred
+            torch.cuda.empty_cache()
+
+        del models_4th
+        torch.cuda.empty_cache()
+        return
+
+    # ==================
     # MODE 1b: Load cached 2nd stage OOF probs (run 3rd, 4th, 5th, 6th)
     # ==================
     if CACHE_2ND_STAGE_DIR is not None:
@@ -1056,6 +1242,8 @@ def evaluate_fold(
                         torch.cuda.empty_cache()
 
                     del image_multichannel_3rd
+                    if iter_idx_3rd == NUM_ITERATIONS_3RD_STAGE - 1:
+                        _save_stage_probs(3, fold_idx, sample_id, ensemble_probs_3rd)
                     pred = (ensemble_probs_3rd > PRED_THRESHOLD_3RD_STAGE).astype(np.uint8)
                     del ensemble_probs_3rd
                     torch.cuda.empty_cache()
@@ -1112,6 +1300,8 @@ def evaluate_fold(
                         torch.cuda.empty_cache()
 
                     del image_multichannel_4th
+                    if iter_idx_4th == NUM_ITERATIONS_4TH_STAGE - 1:
+                        _save_stage_probs(4, fold_idx, sample_id, ensemble_probs_4th)
                     pred = (ensemble_probs_4th > PRED_THRESHOLD_4TH_STAGE).astype(np.uint8)
                     del ensemble_probs_4th
                     torch.cuda.empty_cache()
@@ -1492,6 +1682,8 @@ def evaluate_fold(
                     probs_filename = f"{sample_id}{iter_suffix}_probs.npy"
                     np.save(save_probs_dir / probs_filename, avg_probs_2nd.astype(np.float16))
                     print(f"      Saved 2nd stage probabilities to {probs_filename}")
+                if iter_idx == NUM_ITERATIONS - 1:
+                    _save_stage_probs(2, fold_idx, sample_id, avg_probs_2nd)
 
                 # Threshold to get prediction
                 pred = (avg_probs_2nd > PRED_THRESHOLD_2ND_STAGE).astype(np.uint8)
@@ -1554,6 +1746,8 @@ def evaluate_fold(
                         torch.cuda.empty_cache()
 
                     del image_multichannel_3rd
+                    if iter_idx_3rd == NUM_ITERATIONS_3RD_STAGE - 1:
+                        _save_stage_probs(3, fold_idx, sample_id, ensemble_probs_3rd)
                     pred = (ensemble_probs_3rd > PRED_THRESHOLD_3RD_STAGE).astype(np.uint8)
                     del ensemble_probs_3rd
                     torch.cuda.empty_cache()
@@ -1612,6 +1806,8 @@ def evaluate_fold(
                         torch.cuda.empty_cache()
 
                     del image_multichannel_4th
+                    if iter_idx_4th == NUM_ITERATIONS_4TH_STAGE - 1:
+                        _save_stage_probs(4, fold_idx, sample_id, ensemble_probs_4th)
                     pred = (ensemble_probs_4th > PRED_THRESHOLD_4TH_STAGE).astype(np.uint8)
                     del ensemble_probs_4th
                     torch.cuda.empty_cache()
@@ -1718,6 +1914,9 @@ def evaluate_fold(
 
 def main() -> None:
     global NUM_STAGES, SAVE_PREDS_DIR, CHECKPOINT_PATHS_1ST_STAGE, CACHE_1ST_STAGE_ONLY
+    global CHECKPOINT_PATHS_2ND_STAGE, CHECKPOINT_PATHS_3RD_STAGE, CHECKPOINT_PATHS_4TH_STAGE
+    global CACHE_1ST_STAGE_DIRS, CACHE_2ND_STAGE_DIR, CACHE_3RD_STAGE_DIR
+    global SAVE_FINAL_PROBS_DIR
 
     args = parse_args()
 
@@ -1726,6 +1925,27 @@ def main() -> None:
         NUM_STAGES = args.num_stages
     if args.save_preds_dir is not None:
         SAVE_PREDS_DIR = Path(args.save_preds_dir)
+    if args.save_probs_dir is not None:
+        SAVE_FINAL_PROBS_DIR = Path(args.save_probs_dir)
+    if args.oof_dirs is not None:
+        CACHE_1ST_STAGE_DIRS = [Path(d) for d in args.oof_dirs]
+        CACHE_1ST_STAGE_ONLY = True
+    if args.cache_2nd_stage_dir is not None:
+        CACHE_2ND_STAGE_DIR = Path(args.cache_2nd_stage_dir)
+    if args.cache_3rd_stage_dir is not None:
+        CACHE_3RD_STAGE_DIR = Path(args.cache_3rd_stage_dir)
+
+    # Auto-discover checkpoints from fold directories
+    if args.checkpoint_dir_2nd is not None:
+        print(f"Discovering 2nd stage checkpoints from {args.checkpoint_dir_2nd}:")
+        CHECKPOINT_PATHS_2ND_STAGE = _discover_fold_checkpoints(args.checkpoint_dir_2nd, args.n_folds)
+    if args.checkpoint_dir_3rd is not None:
+        print(f"Discovering 3rd stage checkpoints from {args.checkpoint_dir_3rd}:")
+        CHECKPOINT_PATHS_3RD_STAGE = _discover_fold_checkpoints(args.checkpoint_dir_3rd, args.n_folds)
+    if args.checkpoint_dir_4th is not None:
+        print(f"Discovering 4th stage checkpoints from {args.checkpoint_dir_4th}:")
+        CHECKPOINT_PATHS_4TH_STAGE = _discover_fold_checkpoints(args.checkpoint_dir_4th, args.n_folds)
+
     if args.ckpt_pattern is not None:
         # Build CHECKPOINT_PATHS_1ST_STAGE from glob pattern + checkpoint_dir
         import glob
@@ -1762,7 +1982,9 @@ def main() -> None:
 
     print(f"Folds to evaluate: {folds_to_run}")
     print(f"NUM_STAGES={NUM_STAGES}")
-    if CACHE_4TH_STAGE_DIR:
+    if CACHE_3RD_STAGE_DIR:
+        print(f"Mode: CACHE_3RD_STAGE – loading pre-computed 3rd stage probs from {CACHE_3RD_STAGE_DIR}")
+    elif CACHE_4TH_STAGE_DIR:
         print(f"Mode: CACHE_4TH_STAGE – loading pre-computed 4th stage probs from {CACHE_4TH_STAGE_DIR}, running 5th refinement + DeformNet")
     elif CACHE_2ND_STAGE_DIR:
         print(f"Mode: CACHE_2ND_STAGE – loading pre-computed probs from {CACHE_2ND_STAGE_DIR}")
@@ -1770,6 +1992,8 @@ def main() -> None:
         print(f"Mode: {NUM_STAGES}-Stage inference")
     if SAVE_PREDS_DIR:
         print(f"Saving predictions to: {SAVE_PREDS_DIR}")
+    if SAVE_FINAL_PROBS_DIR:
+        print(f"Saving stage {NUM_STAGES} probs to: {SAVE_FINAL_PROBS_DIR}")
 
     # Evaluate each fold
     for fold_idx in folds_to_run:

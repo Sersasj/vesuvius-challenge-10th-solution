@@ -1,0 +1,22 @@
+# Use torch 2.8.0 install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0
+# torch 2.9.X have a bug for 3D convolutions as of now 03/11/2026
+# it seems to have been fixed in torch 2.10.0 but we have not tested it
+# https://github.com/pytorch/pytorch/issues/166122
+kaggle
+numpy
+pandas
+matplotlib
+scipy
+scikit-image
+timm
+timm-3d
+monai
+pytorch-lightning
+wandb
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+torchmetrics
+
+# Local package (custom architectures)
+-e ./dynamic-network-architectures/
