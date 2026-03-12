@@ -14,17 +14,10 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from monai.inferers import sliding_window_inference
-from monai.inferers.inferer import SlidingWindowInfererAdapt
-from skimage import morphology
-from skimage.segmentation import watershed
-from skimage.feature import peak_local_max
 from sklearn.model_selection import KFold
-from collections import OrderedDict
-from monai import transforms as monai_transforms
-from omegaconf import OmegaConf
 
 # Ensure repo root is on sys.path so `import src...` works even when running via an absolute script path.
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -32,16 +25,6 @@ from src.models.lightning_module import SegmentationModule
 from src_2nd_4th_stages.models.lightning_module import SegmentationModule as SegmentationModule2ndStage
 from src.utils.metric import load_volume
 
-# Tom-style DeformNet (DeformDynUnetV2 from tom_submission_stuff)
-import importlib.util as _ilu
-_deformnet_path = str(_REPO_ROOT / "tom_submission_stuff" / "deformnetv2" / "src" / "models" / "deformNet3d.py")
-_spec = _ilu.spec_from_file_location("deformNet3d", _deformnet_path)
-_deformNet3d = _ilu.module_from_spec(_spec)
-_spec.loader.exec_module(_deformNet3d)
-DeformDynUnetV2 = _deformNet3d.DeformDynUnetV2
-
-# Sergio-style DeformNet (src_deformnet_stage Lightning module)
-from src_deformnet_stage.models.lightning_module import SegmentationModule as DeformSegModule
 
 
 def _load_model_with_ema(module_class, ckpt_path: str, device: torch.device):
@@ -77,111 +60,11 @@ CHECKPOINT_BASE_DIR = Path("1st_stage")
 # Will glob for files matching this pattern and pick the best one
 CHECKPOINT_PATTERN = "best-*.ckpt"
 
-# Direct checkpoint paths mapping - 1st stage models (can be list for ensemble with multiple models including primus)
-CHECKPOINT_PATHS_1ST_STAGE = {
-    "fold0": [
-        "1st_stage_models/fold-0-best-epoch369-val_loss0.3720-val_dice0.5789.ckpt", # resEnc
-        "primus_pretrained/fold0_best-epoch=264-val_loss=0.3657-val_dice=0.5852.ckpt"  #primus
-        "primus_v2/fold0_best-epoch=404-val_loss=0.3655-val_dice=0.5881.ckpt", # primus V2
-    ],
-    "fold1": [
-        "1st_stage_models/fold-1-best-epoch364-val_loss0.3767-val_dice0.5813.ckpt",
-        # "1st_stage_models_primus/fold-1-best.ckpt",
-    ],
-    "fold2": [
-        "1st_stage_models/fold-2-best-epoch384-val_loss0.3647-val_dice0.5865.ckpt",
-        # "1st_stage_models_primus/fold-2-best.ckpt",
-    ],
-    "fold3": [
-        "1st_stage_models/fold-3-best-epoch349-val_loss0.3471-val_dice0.6062.ckpt",
-        # "1st_stage_models_primus/fold-3-best.ckpt",
-    ],
-    "fold4": [
-        "1st_stage_models/fold-4-best-epoch364-val_loss0.3534-val_dice0.6028.ckpt",
-        # "1st_stage_models_primus/fold-4-best.ckpt",
-    ],
-}
-
-# Direct checkpoint paths mapping - 2nd stage models (can be list for ensemble)
-# 4-channel input: [image, resEnc OOF, primus OOF, primusV2 OOF]
-CHECKPOINT_PATHS_2ND_STAGE = {
-    "fold0": [
-        "refineV2_4ch/fold0_best-epoch134-val_dice0.6015-val_loss0.3528.ckpt",
-    ],
-    "fold1": [
-        "refineV2_4ch/fold1_best-epoch119-val_dice0.6102-val_loss0.3507.ckpt",
-    ],
-    "fold2": [
-        "refineV2_4ch/fold_2best-epoch139-val_dice0.6082-val_loss0.3450.ckpt",
-    ],
-    "fold3": [
-        "refineV2_4ch/fold3_best.ckpt",  # TODO: not yet trained
-    ],
-    "fold4": [
-        "refineV2_4ch/fold4_best.ckpt",  # TODO: not yet trained
-    ],
-}
-
-# Input is [image, refineV2 mask]
-CHECKPOINT_PATHS_3RD_STAGE = {
-    "fold0": [
-        "refineV1_new/refine-v1-fold0-best-epoch69-val_dice0.6158-val_loss0.3396.ckpt",
-    ],
-    "fold1": [
-        "refineV1_new/refine-v1-fold1-best-epoch74-val_dice0.6267-val_loss0.3363.ckpt",
-    ]
-}
-CHECKPOINT_PATHS_4TH_STAGE = {
-    "fold0": [
-        "new_refineTom/fold-0-best-epoch=99-val_dice=0.5995-val_loss=0.3575.ckpt",
-        #"RefineTom/fold-0-best-epoch=114-val_dice=0.6000-val_loss=0.3570.ckpt"
-    ],
-    "fold1": "RefineTom/fold-1-best-epoch=64-val_dice=0.6097-val_loss=0.3562.ckpt",
-}
-CHECKPOINT_PATHS_5TH_STAGE = {
-    "fold0": "5th_stage_tom/fold0_best-epoch=99-val_dice=0.5994-val_loss=0.3583.ckpt",
-    "fold1": "5th_stage_tom/best-epoch=114-val_dice=0.6088-val_loss=0.3558.ckpt",
-}
-
-# 6th stage: DeformNet (diffeomorphic registration)
-# Each entry can be:
-#   "path/to/ckpt"             – plain string, defaults to "tom" loader (DeformDynUnetV2)
-#   ("path/to/ckpt", "tom")    – Tom's DeformDynUnetV2 (tom_submission_stuff)
-#   ("path/to/ckpt", "sergio") – Sergio's DeformSegModule (src_deformnet_stage Lightning module)
-CHECKPOINT_PATHS_6TH_STAGE = {
-    "fold0": [
-        ("deformSergio/fold-0-best-epoch=74-val_dice=0.5980-val_loss=0.4271.ckpt", "sergio"),
-        ("bestDeformnet/0594/deform-dynunet-v2-k3-s5-customFalse-fold0-epoch=19-val_bias_comp_metric=0.7012.ckpt", "tom"),
-        ("bestDeformnet/0594/deform-dynunet-v2-k3-s5-fold0-epoch=29-val_bias_comp_metric=0.6885.ckpt", "tom"),
-    ],
-    "fold1": ("diffeomophic-3stage-vesuvius-challenge-pytorch-default-v9/deform-dynunet-v2-k3-s5-customFalse-fold1-epoch59-val_bias_comp_metric0.7453.ckpt", "tom"),
-    "fold2": ("diffeomophic-3stage-vesuvius-challenge-pytorch-default-v9/deform-dynunet-v2-k3-s5-customFalse-fold2-epoch109-val_bias_comp_metric0.7393.ckpt", "tom"),
-    "fold3": ("diffeomophic-3stage-vesuvius-challenge-pytorch-default-v9/deform-dynunet-v2-k3-s5-customFalse-fold3-epoch74-val_bias_comp_metric0.7413.ckpt", "tom"),
-    "fold4": ("diffeomophic-3stage-vesuvius-challenge-pytorch-default-v9/deform-dynunet-v2-k3-s5-customFalse-fold4-epoch89-val_bias_comp_metric0.7496.ckpt", "tom"),
-}
-
-# DeformNet hyperparameters – Tom loader (DeformDynUnetV2)
-DEFORM_KERNEL_SIZE_TOM = 3
-DEFORM_SIGMA_TOM = 5
-DEFORM_BINARIZE_THRESHOLD = 0.3
-DEFORM_FINAL_THRESHOLD = 0.5
-DEFORM_WEIGHT_SERGIO = 0.3  # Weight for Sergio-style DeformNet in ensemble
-DEFORM_WEIGHT_TOM = 0.7     # Weight for Tom-style DeformNet in ensemble
-DEFORM_OVERLAP = 0.5
-DEFORM_INPUT_SIZE = (160, 160, 160)
-
-DEFORM_CFG = OmegaConf.create({
-    "use_resenc": True,
-    "max_v": 1.5,
-    "n_steps": 6,
-    "input_size": list(DEFORM_INPUT_SIZE),
-    "out_channels": 4,
-    "max_topo_offset": 1.0,
-})
-
-# DeformNet hyperparameters – Sergio loader (src_deformnet_stage DeformSegModule)
-DEFORM_KERNEL_SIZE_SERGIO = 3
-DEFORM_SIGMA_SERGIO = 5
+# Checkpoint path dicts — populated via CLI args (--ckpt_pattern, --checkpoint_dir_2nd, etc.)
+CHECKPOINT_PATHS_1ST_STAGE = {}
+CHECKPOINT_PATHS_2ND_STAGE = {}
+CHECKPOINT_PATHS_3RD_STAGE = {}
+CHECKPOINT_PATHS_4TH_STAGE = {}
 
 # Main training CSV used to determine fold splits
 TRAIN_CSV_PATH = Path("train.csv")
@@ -197,13 +80,11 @@ PATCH_SIZE_1ST_STAGE: Optional[int] = 160
 PATCH_SIZE_2ND_STAGE: Optional[int] = 160
 PATCH_SIZE_3RD_STAGE: Optional[int] = 160
 PATCH_SIZE_4TH_STAGE: Optional[int] = 160
-PATCH_SIZE_5TH_STAGE: Optional[int] = 160
 SW_BATCH_SIZE = 1
 OVERLAP_1ST_STAGE = 0.5
 OVERLAP_2ND_STAGE = 0.5
 OVERLAP_3RD_STAGE = 0.5
 OVERLAP_4TH_STAGE = 0.5
-OVERLAP_5TH_STAGE = 0.5
 SW_MODE = "gaussian"
 SW_SIGMA_SCALE = 0.125  # Gaussian blending sigma = sigma_scale * roi_dim (used when mode="gaussian")
 PADDING_MODE = "reflect"
@@ -216,20 +97,18 @@ PRED_THRESHOLD_1ST_STAGE: float | Tuple[float, ...] = (0.3, 0.3, 0.3)  # (resEnc
 PRED_THRESHOLD_2ND_STAGE = 0.3
 PRED_THRESHOLD_3RD_STAGE = 0.3
 PRED_THRESHOLD_4TH_STAGE = 0.3
-PRED_THRESHOLD_5TH_STAGE = 0.3
 
 USE_TTA = True
 USE_POST_PROCESSING = True
 POST_PROCESS_MIN_CC_VOLUME = 3000
 
-# How many stages to run: 1 = 1st only, ..., 5 = +5th refinement, 6 = all including DeformNet
-NUM_STAGES = 6
+# How many stages to run: 1 = 1st only, ..., 4 = +4th refinement
+NUM_STAGES = 4
 
 # 2nd stage specific settings
 NUM_ITERATIONS = 1  # Number of refinement iterations for 2nd stage
 NUM_ITERATIONS_3RD_STAGE = 2  # Number of refinement iterations for 3rd stage
 NUM_ITERATIONS_4TH_STAGE = 1  # Number of refinement iterations for 4th stage
-NUM_ITERATIONS_5TH_STAGE = 0  # Number of refinement iterations for 5th stage
 SAVE_PREDS_DIR: Optional[Path] = None
 SAVE_2ND_STAGE_PROBS: bool = False  # Save 2nd stage probability masks
 SAVE_2ND_STAGE_PROBS_DIR: Optional[Path] = "2nd_stage_probs"  # Directory for 2nd stage probabilities (defaults to SAVE_PREDS_DIR/probs if None)
@@ -249,10 +128,6 @@ CACHE_2ND_STAGE_DIR: Optional[Path] = None  # Set to None to run inference
 
 # 3rd stage caching – load pre-computed 3rd stage OOF probabilities (skip 1st–3rd inference, run 4th stage)
 CACHE_3RD_STAGE_DIR: Optional[Path] = None  # Set to None to run inference
-
-# 4th stage caching – load pre-computed 4th stage OOF probabilities (skip 1st–4th inference, run only DeformNet)
-# Set to a directory with {sample_id}_probs.npy files (e.g. output of generate_oof_4_stage.py)
-CACHE_4TH_STAGE_DIR: Optional[Path] = None  # Set to None to run full pipeline
 
 # Generic: save the final stage's probability maps to this directory
 SAVE_FINAL_PROBS_DIR: Optional[Path] = None
@@ -301,7 +176,7 @@ def parse_args():
         "--num_stages",
         type=int,
         default=None,
-        help="Number of stages to run (1-6). Overrides NUM_STAGES global."
+        help="Number of stages to run (1-4). Overrides NUM_STAGES global."
     )
     parser.add_argument(
         "--save_preds_dir",
@@ -484,208 +359,6 @@ def postprocess_mask_voxel(mask, min_cc_volume=3000, median_iters=7, verbose=Tru
 
         return mask
 
-# ==========================
-# DeformNet Utilities (6th Stage)
-# ==========================
-
-def gaussian_kernel_3d(kernel_size: int, sigma: float, device: torch.device) -> torch.Tensor:
-    """Returns a normalized 3D Gaussian kernel."""
-    ax = torch.arange(kernel_size, device=device) - kernel_size // 2
-    xx, yy, zz = torch.meshgrid(ax, ax, ax, indexing='ij')
-    kernel = torch.exp(-(xx**2 + yy**2 + zz**2) / (2 * sigma**2))
-    return kernel / kernel.sum()
-
-
-def gaussian_blur_3d(x: torch.Tensor, kernel_size: int, sigma: float, device: torch.device) -> torch.Tensor:
-    _, C, _, _, _ = x.shape
-    kernel = gaussian_kernel_3d(kernel_size, sigma, device)
-    kernel = kernel.expand(C, 1, kernel_size, kernel_size, kernel_size)
-    return F.conv3d(x, kernel, padding=kernel_size // 2, groups=C)
-
-
-def load_deform_model_from_checkpoint(model: torch.nn.Module, ckpt_path: Path) -> None:
-    """Load DeformNet model weights from checkpoint (Tom-style, strips 'model.' prefix)."""
-    ckpt = torch.load(ckpt_path, weights_only=False)
-    state_dict = ckpt.get('state_dict', ckpt)
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        new_key = k.replace("model.", "") if k.startswith("model.") else k
-        new_state_dict[new_key] = v
-    model.load_state_dict(new_state_dict)
-
-
-@torch.no_grad()
-def one_step_inference_deform(
-    prob_mask: torch.Tensor,
-    vol: torch.Tensor,
-    kernel_size: int,
-    sigma: float,
-    deformnet_list: list,
-    is_prob: bool,
-    apply_gaussian: bool,
-    threshold: float,
-    sliding_window_inferer: SlidingWindowInfererAdapt,
-    device: torch.device,
-) -> torch.Tensor:
-    """Single-GPU DeformNet inference step (Tom-style)."""
-    if not is_prob:
-        prob_mask = (prob_mask > threshold).float()
-
-    if apply_gaussian:
-        prob_mask_device = prob_mask.to(device)
-        prev_mask_pred = gaussian_blur_3d(prob_mask_device, kernel_size, sigma, device)
-        del prob_mask_device
-    else:
-        prev_mask_pred = prob_mask.to(device)
-
-    vol_device = vol.to(device)
-    x = torch.cat([vol_device, prev_mask_pred], dim=1)
-    del vol_device, prev_mask_pred
-    x = x.cpu()
-
-    predictions = []
-    for model in deformnet_list:
-        x_device = x.to(device)
-        pred_warped = sliding_window_inferer(x_device, model)
-        predictions.append(pred_warped.cpu())
-        del x_device
-        torch.cuda.empty_cache()
-
-    return torch.cat(predictions, dim=0).mean(dim=0)
-
-
-@torch.no_grad()
-def _predict_deformnet_tom(
-    tom_models: list,
-    image_3d: np.ndarray,
-    prob_mask: np.ndarray,
-    *,
-    device: torch.device,
-    binarize_threshold: float,
-    final_threshold: float,
-    sliding_window_inferer: SlidingWindowInfererAdapt,
-    deformnet_transforms_fn,
-) -> np.ndarray:
-    """Run Tom-style DeformDynUnetV2 inference. Returns probability array (D,H,W) in [0,1]."""
-    raw = {"Image": image_3d, "Mask_OOF": prob_mask}
-    _data = deformnet_transforms_fn(raw)
-    vol = _data['Image'][None,]
-    mask = _data['Mask_OOF'][None,]
-
-    vol = vol.to(device)
-    mask = mask.to(device).float()
-
-    prediction = one_step_inference_deform(
-        mask, vol, DEFORM_KERNEL_SIZE_TOM, DEFORM_SIGMA_TOM,
-        tom_models, is_prob=False, apply_gaussian=True,
-        threshold=binarize_threshold,
-        sliding_window_inferer=sliding_window_inferer,
-        device=device,
-    )
-
-    del vol, mask
-    torch.cuda.empty_cache()
-
-    return prediction[0].cpu().numpy().astype(np.float32)
-
-
-@torch.no_grad()
-def _predict_deformnet_sergio(
-    sergio_models: list,
-    image_3d: np.ndarray,
-    prob_mask: np.ndarray,
-    *,
-    device: torch.device,
-    binarize_threshold: float,
-) -> np.ndarray:
-    """Run Sergio-style DeformSegModule (src_deformnet_stage) inference. Returns probability array (D,H,W) in [0,1]."""
-    vol = torch.from_numpy(image_3d.astype(np.float32)).unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
-    if vol.max() > 0:
-        vol = vol / 255.0
-
-    mask = torch.from_numpy(prob_mask.astype(np.float32)).unsqueeze(0).unsqueeze(0)  # (1,1,D,H,W)
-    mask = (mask > binarize_threshold).float()
-    mask = gaussian_blur_3d(mask.to(device), DEFORM_KERNEL_SIZE_SERGIO, DEFORM_SIGMA_SERGIO, device).cpu()
-
-    x = torch.cat([vol, mask], dim=1)  # (1, 2, D, H, W)
-    del vol, mask
-
-    roi_size = DEFORM_INPUT_SIZE
-    predictions = []
-    for model in sergio_models:
-        with torch.inference_mode(), torch.autocast(
-            device_type="cuda" if device.type == "cuda" else "cpu",
-            enabled=(device.type == "cuda"),
-        ):
-            out = sliding_window_inference(
-                inputs=x, roi_size=roi_size, sw_batch_size=1,
-                predictor=model, overlap=DEFORM_OVERLAP, mode="gaussian",
-                sigma_scale=SW_SIGMA_SCALE, padding_mode=PADDING_MODE,
-                progress=True, sw_device=device, device='cpu',
-            )
-        predictions.append(out)
-        torch.cuda.empty_cache()
-
-    prediction_ensemble = torch.cat(predictions, dim=0).mean(dim=0)  # (1, D, H, W)
-    del predictions, x
-    torch.cuda.empty_cache()
-
-    return prediction_ensemble[0].cpu().numpy().astype(np.float32)
-
-
-@torch.no_grad()
-def predict_volume_deformnet(
-    deformnet_entries: list,
-    image_3d: np.ndarray,
-    prob_mask: np.ndarray,
-    *,
-    device: torch.device,
-    binarize_threshold: float,
-    final_threshold: float,
-    sliding_window_inferer: SlidingWindowInfererAdapt,
-    deformnet_transforms_fn,
-) -> np.ndarray:
-    """Run mixed-ensemble DeformNet inference (supports both 'tom' and 'sergio' entries).
-
-    deformnet_entries: list of (model, kind) where kind is 'tom' or 'sergio'.
-    Returns binary mask (D,H,W) uint8.
-    """
-    tom_models = [m for m, kind in deformnet_entries if kind == "tom"]
-    sergio_models = [m for m, kind in deformnet_entries if kind == "sergio"]
-
-    all_probs = []
-
-    if tom_models and sliding_window_inferer is not None and deformnet_transforms_fn is not None:
-        probs_tom = _predict_deformnet_tom(
-            tom_models, image_3d, prob_mask,
-            device=device,
-            binarize_threshold=binarize_threshold,
-            final_threshold=final_threshold,
-            sliding_window_inferer=sliding_window_inferer,
-            deformnet_transforms_fn=deformnet_transforms_fn,
-        )
-        all_probs.append(probs_tom)
-
-    if sergio_models:
-        probs_sergio = _predict_deformnet_sergio(
-            sergio_models, image_3d, prob_mask,
-            device=device,
-            binarize_threshold=binarize_threshold,
-        )
-        all_probs.append(probs_sergio)
-
-    if not all_probs:
-        return prob_mask.astype(np.uint8)
-
-    # Weighted ensemble: if both tom and sergio are present, use configured weights
-    if tom_models and sergio_models and len(all_probs) == 2:
-        # all_probs[0] = tom, all_probs[1] = sergio (appended in that order above)
-        avg_probs = DEFORM_WEIGHT_TOM * all_probs[0] + DEFORM_WEIGHT_SERGIO * all_probs[1]
-    else:
-        avg_probs = np.mean(np.stack(all_probs, axis=0), axis=0)
-    return (avg_probs > final_threshold).astype(np.uint8)
-
-
 def apply_tta_transform(volume: np.ndarray, flip_dims: Optional[list] = None, rotation_k: int = 0) -> np.ndarray:
     """Apply TTA transform to volume."""
     vol_torch = torch.from_numpy(volume.copy())
@@ -780,98 +453,6 @@ def _load_4th_stage_refinement_models(fold_key: str, device: torch.device):
     return models_4th
 
 
-def _load_5th_stage_refinement_models(fold_key: str, device: torch.device):
-    """Load 5th stage refinement model(s) (SegmentationModule2ndStage). Returns list of models or []."""
-    if fold_key not in CHECKPOINT_PATHS_5TH_STAGE:
-        return []
-
-    ckpt_raw = CHECKPOINT_PATHS_5TH_STAGE[fold_key]
-    ckpt_paths = [Path(p) for p in (ckpt_raw if isinstance(ckpt_raw, list) else [ckpt_raw])]
-
-    models_5th = []
-    for i, ckpt_path in enumerate(ckpt_paths):
-        if not ckpt_path.exists():
-            print(f"WARNING: 5th stage checkpoint not found: {ckpt_path}")
-            return []
-        print(f"  Loading 5th stage refinement model {i+1}/{len(ckpt_paths)}: {ckpt_path.name}")
-        m = _load_model_with_ema(SegmentationModule2ndStage, str(ckpt_path), device)
-        models_5th.append(m)
-    return models_5th
-
-
-def _parse_deform_ckpt_entry(entry) -> Tuple[str, str]:
-    """Parse a checkpoint entry into (path_str, kind).
-
-    Accepts:
-      "path/to/ckpt"           → (path, "tom")  [default]
-      ("path/to/ckpt", "tom")  → (path, "tom")
-      ("path/to/ckpt", "sergio") → (path, "sergio")
-    """
-    if isinstance(entry, str):
-        return entry, "tom"
-    path, kind = entry
-    assert kind in ("tom", "sergio"), f"Unknown deform kind '{kind}', expected 'tom' or 'sergio'"
-    return str(path), kind
-
-
-def _load_deformnet_models(fold_key: str, device: torch.device):
-    """Load 6th stage DeformNet model(s).
-
-    Checkpoint entries may mix 'tom' (DeformDynUnetV2) and 'sergio' (DeformSegModule) models.
-    Returns (deformnet_entries, deform_swi, deform_tfn) where:
-      deformnet_entries – list of (model, kind)
-      deform_swi        – SlidingWindowInfererAdapt for tom models (None if no tom models)
-      deform_tfn        – monai transforms for tom models (None if no tom models)
-    """
-    if fold_key not in CHECKPOINT_PATHS_6TH_STAGE:
-        print(f"  No DeformNet checkpoint for {fold_key}, skipping")
-        return None, None, None
-
-    ckpt_raw = CHECKPOINT_PATHS_6TH_STAGE[fold_key]
-    raw_list = ckpt_raw if isinstance(ckpt_raw, list) else [ckpt_raw]
-
-    deformnet_entries = []
-    has_tom = False
-
-    for i, raw_entry in enumerate(raw_list):
-        path_str, kind = _parse_deform_ckpt_entry(raw_entry)
-        ckpt_path = Path(path_str)
-
-        if not ckpt_path.exists():
-            print(f"WARNING: DeformNet checkpoint not found: {ckpt_path}")
-            return None, None, None
-
-        print(f"  Loading DeformNet [{kind}] model {i+1}/{len(raw_list)}: {ckpt_path.name}")
-
-        if kind == "tom":
-            m = DeformDynUnetV2(DEFORM_CFG).to(device)
-            m.eval()
-            load_deform_model_from_checkpoint(m, ckpt_path)
-            has_tom = True
-        else:  # "sergio"
-            m = _load_model_with_ema(DeformSegModule, str(ckpt_path), device)
-
-        deformnet_entries.append((m, kind))
-
-    deform_swi, deform_tfn = None, None
-    if has_tom:
-        deform_swi = SlidingWindowInfererAdapt(
-            roi_size=DEFORM_INPUT_SIZE, sw_batch_size=1,
-            overlap=DEFORM_OVERLAP, mode="gaussian", sigma_scale=SW_SIGMA_SCALE, progress=True,
-        )
-
-        deform_tfn = monai_transforms.Compose([
-            monai_transforms.EnsureChannelFirstd(keys=["Image", "Mask_OOF"], channel_dim="no_channel"),
-            monai_transforms.EnsureTyped(keys=["Image", "Mask_OOF"], dtype=np.float32),
-            monai_transforms.ScaleIntensityRanged(
-                keys=["Image"], a_min=0.0, a_max=213.0, b_min=-5.0, b_max=5.0, clip=True,
-            ),
-            monai_transforms.ToTensord(keys=["Image", "Mask_OOF"]),
-        ])
-
-    return deformnet_entries, deform_swi, deform_tfn
-
-
 def evaluate_fold(
     fold_idx: int,
     val_df: pd.DataFrame,
@@ -880,10 +461,10 @@ def evaluate_fold(
 ) -> pd.DataFrame:
     """Evaluate a single fold with multi-stage inference and return results DataFrame.
 
-    Supports four modes:
-    1. CACHE_4TH_STAGE_DIR set: load pre-computed 4th stage OOF probs, run 5th + 6th stages
-    2. CACHE_2ND_STAGE_DIR set: load pre-computed 2nd stage OOF probs, run 3rd–6th stages
-    3. CACHE_1ST_STAGE_ONLY: load cached 1st stage probs, run 2nd–6th stage inference
+    Supports three modes:
+    1. CACHE_3RD_STAGE_DIR set: load pre-computed 3rd stage OOF probs, run 4th stage
+    2. CACHE_2ND_STAGE_DIR set: load pre-computed 2nd stage OOF probs, run 3rd–4th stages
+    3. CACHE_1ST_STAGE_ONLY: load cached 1st stage probs, run 2nd–4th stage inference
     4. Full: run all stages from scratch
     """
     print(f"\n{'='*60}")
@@ -891,138 +472,6 @@ def evaluate_fold(
     print(f"{'='*60}")
 
     fold_key = f"fold{fold_idx}"
-
-    # ==================
-    # MODE 1a: Load cached 4th stage OOF probs (run only 5th refinement + DeformNet)
-    # ==================
-    if CACHE_4TH_STAGE_DIR is not None:
-        cache_4th_dir = Path(CACHE_4TH_STAGE_DIR)
-        cache_4th_fold_dir = cache_4th_dir / f"fold_{fold_idx}"
-        cache_4th_probs_dir = cache_4th_fold_dir / "probs"
-        print(f"CACHE_4TH_STAGE mode – loading from {cache_4th_dir}, running 5th refinement + DeformNet")
-
-        # Load 5th stage refinement model(s)
-        models_5th = []
-        if NUM_STAGES >= 5:
-            models_5th = _load_5th_stage_refinement_models(fold_key, device)
-        patch_size_5th = PATCH_SIZE_5TH_STAGE or 128
-        roi_size_5th = (patch_size_5th, patch_size_5th, patch_size_5th)
-
-        # Load 6th stage (DeformNet) model(s)
-        deformnet_entries, deform_swi, deform_tfn = None, None, None
-        if NUM_STAGES >= 6:
-            deformnet_entries, deform_swi, deform_tfn = _load_deformnet_models(fold_key, device)
-
-        if not models_5th and deformnet_entries is None:
-            print(f"  WARNING: No 5th or 6th stage checkpoint for {fold_key}, will evaluate 4th stage only")
-
-        val_df = val_df.head(max_samples)
-        print(f"Evaluating {len(val_df)} samples for fold {fold_idx}")
-
-        for sample_idx, (_, row) in enumerate(val_df.iterrows()):
-            sample_id = row["id"]
-            print(f"    [{sample_idx+1}/{len(val_df)}] Processing: {sample_id}")
-
-            # Try to find cached 4th stage probs
-            probs = None
-            for try_dir in [cache_4th_dir, cache_4th_fold_dir, cache_4th_probs_dir]:
-                cache_file = try_dir / f"{sample_id}_probs.npy"
-                if cache_file.exists():
-                    print(f"    Loading cached 4th stage probs from {cache_file}")
-                    probs = np.load(cache_file).astype(np.float32)
-                    break
-
-            if probs is None:
-                print(f"    SKIP: No cached 4th stage probs found for {sample_id}")
-                continue
-
-            pred = (probs > PRED_THRESHOLD_4TH_STAGE).astype(np.uint8)
-            del probs
-
-            image = np.asarray(load_volume(_find_file(IMAGE_DIR, sample_id)))
-
-            # 5TH STAGE: Refine with [image, 4th stage mask] - N iterations
-            if models_5th:
-                image_normalized_5th = image.astype(np.float32) / 255.0
-                current_mask_5th = pred.astype(np.float32)
-
-                for iter_idx_5th in range(NUM_ITERATIONS_5TH_STAGE):
-                    image_multichannel_5th = np.stack([image_normalized_5th, current_mask_5th], axis=0)
-
-                    ensemble_probs_5th = None
-                    for model_idx, model_5th in enumerate(models_5th):
-                        print(f"      5th stage model {model_idx+1}/{len(models_5th)} (iter {iter_idx_5th+1}/{NUM_ITERATIONS_5TH_STAGE})")
-
-                        x = torch.from_numpy(image_multichannel_5th).float().unsqueeze(0)
-                        torch.cuda.empty_cache()
-
-                        with torch.inference_mode(), torch.autocast(
-                            device_type="cuda" if device.type == "cuda" else "cpu",
-                            enabled=(device.type == "cuda")
-                        ):
-                            out = sliding_window_inference(
-                                inputs=x, roi_size=roi_size_5th, sw_batch_size=SW_BATCH_SIZE,
-                                predictor=model_5th, overlap=OVERLAP_5TH_STAGE, mode=SW_MODE,
-                                sigma_scale=SW_SIGMA_SCALE, padding_mode=PADDING_MODE, progress=False,
-                                sw_device=device, device='cpu'
-                            )
-
-                        del x
-                        torch.cuda.empty_cache()
-
-                        if isinstance(out, (list, tuple)):
-                            out = out[0]
-                        if out.shape[2:] != image.shape:
-                            out = F.interpolate(out, size=image.shape, mode='trilinear', align_corners=False)
-
-                        model_probs_5th = F.softmax(out, dim=1)[:, 1][0].detach().cpu().numpy()
-                        del out
-                        torch.cuda.empty_cache()
-
-                        if ensemble_probs_5th is None:
-                            ensemble_probs_5th = model_probs_5th / len(models_5th)
-                        else:
-                            ensemble_probs_5th += model_probs_5th / len(models_5th)
-                        del model_probs_5th
-                        torch.cuda.empty_cache()
-
-                    del image_multichannel_5th
-                    pred = (ensemble_probs_5th > PRED_THRESHOLD_5TH_STAGE).astype(np.uint8)
-                    del ensemble_probs_5th
-                    torch.cuda.empty_cache()
-
-                    if iter_idx_5th < NUM_ITERATIONS_5TH_STAGE - 1:
-                        current_mask_5th = pred.astype(np.float32)
-
-                del image_normalized_5th, current_mask_5th
-                torch.cuda.empty_cache()
-
-            # 6TH STAGE: DeformNet refinement
-            if deformnet_entries:
-                print(f"      Running 6th stage (DeformNet) with {len(deformnet_entries)} model(s)...")
-                pred_deform = predict_volume_deformnet(
-                    deformnet_entries,
-                    image,
-                    pred.astype(np.float32),
-                    device=device,
-                    binarize_threshold=DEFORM_BINARIZE_THRESHOLD,
-                    final_threshold=DEFORM_FINAL_THRESHOLD,
-                    sliding_window_inferer=deform_swi,
-                    deformnet_transforms_fn=deform_tfn,
-                )
-                print(f"      DeformNet complete. Positive ratio: {pred_deform.mean():.4f}")
-                pred = pred_deform
-                del pred_deform
-            torch.cuda.empty_cache()
-
-            del image, pred
-            torch.cuda.empty_cache()
-
-        del models_5th
-        if deformnet_entries:
-            del deformnet_entries
-        torch.cuda.empty_cache()
-        return
 
     # ==================
     # MODE 1c: Load cached 3rd stage OOF probs (run 4th stage only)
@@ -1126,7 +575,7 @@ def evaluate_fold(
         return
 
     # ==================
-    # MODE 1b: Load cached 2nd stage OOF probs (run 3rd, 4th, 5th, 6th)
+    # MODE 1b: Load cached 2nd stage OOF probs (run 3rd, 4th)
     # ==================
     if CACHE_2ND_STAGE_DIR is not None:
         cache_2nd_dir = Path(CACHE_2ND_STAGE_DIR)
@@ -1157,18 +606,6 @@ def evaluate_fold(
             models_4th = _load_4th_stage_refinement_models(fold_key, device)
         patch_size_4th = PATCH_SIZE_4TH_STAGE or 128
         roi_size_4th = (patch_size_4th, patch_size_4th, patch_size_4th)
-
-        # Load 5th stage refinement model(s)
-        models_5th = []
-        if NUM_STAGES >= 5:
-            models_5th = _load_5th_stage_refinement_models(fold_key, device)
-        patch_size_5th = PATCH_SIZE_5TH_STAGE or 128
-        roi_size_5th = (patch_size_5th, patch_size_5th, patch_size_5th)
-
-        # Load 6th stage (DeformNet) model(s)
-        deformnet_entries, deform_swi, deform_tfn = None, None, None
-        if NUM_STAGES >= 6:
-            deformnet_entries, deform_swi, deform_tfn = _load_deformnet_models(fold_key, device)
 
         val_df = val_df.head(max_samples)
         print(f"Evaluating {len(val_df)} samples for fold {fold_idx}")
@@ -1312,86 +749,10 @@ def evaluate_fold(
                 del image_normalized_4th, current_mask_4th
                 torch.cuda.empty_cache()
 
-            # 5TH STAGE: Refine with [image, 4th stage mask] - N iterations
-            if models_5th:
-                image_normalized_5th = image.astype(np.float32) / 255.0
-                current_mask_5th = pred.astype(np.float32)
-
-                for iter_idx_5th in range(NUM_ITERATIONS_5TH_STAGE):
-                    image_multichannel_5th = np.stack([image_normalized_5th, current_mask_5th], axis=0)
-
-                    ensemble_probs_5th = None
-                    for model_idx, model_5th in enumerate(models_5th):
-                        print(f"      5th stage model {model_idx+1}/{len(models_5th)} (iter {iter_idx_5th+1}/{NUM_ITERATIONS_5TH_STAGE})")
-
-                        x = torch.from_numpy(image_multichannel_5th).float().unsqueeze(0)
-                        torch.cuda.empty_cache()
-
-                        with torch.inference_mode(), torch.autocast(
-                            device_type="cuda" if device.type == "cuda" else "cpu",
-                            enabled=(device.type == "cuda")
-                        ):
-                            out = sliding_window_inference(
-                                inputs=x, roi_size=roi_size_5th, sw_batch_size=SW_BATCH_SIZE,
-                                predictor=model_5th, overlap=OVERLAP_5TH_STAGE, mode=SW_MODE,
-                                sigma_scale=SW_SIGMA_SCALE, padding_mode=PADDING_MODE, progress=False,
-                                sw_device=device, device='cpu'
-                            )
-
-                        del x
-                        torch.cuda.empty_cache()
-
-                        if isinstance(out, (list, tuple)):
-                            out = out[0]
-                        if out.shape[2:] != image.shape:
-                            out = F.interpolate(out, size=image.shape, mode='trilinear', align_corners=False)
-
-                        model_probs_5th = F.softmax(out, dim=1)[:, 1][0].detach().cpu().numpy()
-                        del out
-                        torch.cuda.empty_cache()
-
-                        if ensemble_probs_5th is None:
-                            ensemble_probs_5th = model_probs_5th / len(models_5th)
-                        else:
-                            ensemble_probs_5th += model_probs_5th / len(models_5th)
-                        del model_probs_5th
-                        torch.cuda.empty_cache()
-
-                    del image_multichannel_5th
-                    pred = (ensemble_probs_5th > PRED_THRESHOLD_5TH_STAGE).astype(np.uint8)
-                    del ensemble_probs_5th
-                    torch.cuda.empty_cache()
-
-                    if iter_idx_5th < NUM_ITERATIONS_5TH_STAGE - 1:
-                        current_mask_5th = pred.astype(np.float32)
-
-                del image_normalized_5th, current_mask_5th
-                torch.cuda.empty_cache()
-
-            # 6TH STAGE: DeformNet refinement
-            if deformnet_entries:
-                print(f"      Running 6th stage (DeformNet) with {len(deformnet_entries)} model(s)...")
-                pred_deform = predict_volume_deformnet(
-                    deformnet_entries,
-                    image,
-                    pred.astype(np.float32),
-                    device=device,
-                    binarize_threshold=DEFORM_BINARIZE_THRESHOLD,
-                    final_threshold=DEFORM_FINAL_THRESHOLD,
-                    sliding_window_inferer=deform_swi,
-                    deformnet_transforms_fn=deform_tfn,
-                )
-                print(f"      DeformNet complete. Positive ratio: {pred_deform.mean():.4f}")
-                pred = pred_deform
-                del pred_deform
-                torch.cuda.empty_cache()
-
             del image, pred
             torch.cuda.empty_cache()
 
-        del models_3rd, models_4th, models_5th
-        if deformnet_entries:
-            del deformnet_entries
+        del models_3rd, models_4th
         torch.cuda.empty_cache()
         return
 
@@ -1487,27 +848,15 @@ def evaluate_fold(
     if NUM_STAGES >= 4:
         models_4th = _load_4th_stage_refinement_models(fold_key, device)
 
-    # Load 5th stage refinement model(s)
-    models_5th = []
-    if NUM_STAGES >= 5:
-        models_5th = _load_5th_stage_refinement_models(fold_key, device)
-
-    # Load 6th stage (DeformNet) model(s)
-    deformnet_entries, deform_swi, deform_tfn = None, None, None
-    if NUM_STAGES >= 6:
-        deformnet_entries, deform_swi, deform_tfn = _load_deformnet_models(fold_key, device)
-
     patch_size_1st = PATCH_SIZE_1ST_STAGE or 128
     patch_size_2nd = PATCH_SIZE_2ND_STAGE or 128
     patch_size_3rd = PATCH_SIZE_3RD_STAGE or 128
     patch_size_4th = PATCH_SIZE_4TH_STAGE or 128
-    patch_size_5th = PATCH_SIZE_5TH_STAGE or 128
     roi_size_1st = (patch_size_1st, patch_size_1st, patch_size_1st)
     roi_size_2nd = (patch_size_2nd, patch_size_2nd, patch_size_2nd)
     roi_size_3rd = (patch_size_3rd, patch_size_3rd, patch_size_3rd)
     roi_size_4th = (patch_size_4th, patch_size_4th, patch_size_4th)
-    roi_size_5th = (patch_size_5th, patch_size_5th, patch_size_5th)
-    print(f"Sliding window roi_size_1st={roi_size_1st}, roi_size_2nd={roi_size_2nd}, roi_size_3rd={roi_size_3rd}, roi_size_4th={roi_size_4th}, roi_size_5th={roi_size_5th}")
+    print(f"Sliding window roi_size_1st={roi_size_1st}, roi_size_2nd={roi_size_2nd}, roi_size_3rd={roi_size_3rd}, roi_size_4th={roi_size_4th}")
 
     # Limit samples
     val_df = val_df.head(max_samples)
@@ -1818,82 +1167,6 @@ def evaluate_fold(
                 del image_normalized_4th, current_mask_4th
                 torch.cuda.empty_cache()
 
-            # ==================
-            # 5TH STAGE: Refine with [image, 4th stage mask] - N iterations
-            # ==================
-            if NUM_STAGES >= 5 and models_5th:
-                image_normalized_5th = image.astype(np.float32) / 255.0
-                current_mask_5th = pred.astype(np.float32)
-
-                for iter_idx_5th in range(NUM_ITERATIONS_5TH_STAGE):
-                    image_multichannel_5th = np.stack([image_normalized_5th, current_mask_5th], axis=0)
-
-                    ensemble_probs_5th = None
-                    for model_idx, model_5th in enumerate(models_5th):
-                        print(f"      5th stage model {model_idx+1}/{len(models_5th)} (iter {iter_idx_5th+1}/{NUM_ITERATIONS_5TH_STAGE})")
-
-                        x = torch.from_numpy(image_multichannel_5th).float().unsqueeze(0)
-                        torch.cuda.empty_cache()
-
-                        with torch.inference_mode(), torch.autocast(
-                            device_type="cuda" if device.type == "cuda" else "cpu",
-                            enabled=(device.type == "cuda")
-                        ):
-                            out = sliding_window_inference(
-                                inputs=x, roi_size=roi_size_5th, sw_batch_size=SW_BATCH_SIZE,
-                                predictor=model_5th, overlap=OVERLAP_5TH_STAGE, mode=SW_MODE,
-                                sigma_scale=SW_SIGMA_SCALE, padding_mode=PADDING_MODE, progress=False,
-                                sw_device=device, device='cpu'
-                            )
-
-                        del x
-                        torch.cuda.empty_cache()
-
-                        if isinstance(out, (list, tuple)):
-                            out = out[0]
-                        if out.shape[2:] != image.shape:
-                            out = F.interpolate(out, size=image.shape, mode='trilinear', align_corners=False)
-
-                        model_probs_5th = F.softmax(out, dim=1)[:, 1][0].detach().cpu().numpy()
-                        del out
-                        torch.cuda.empty_cache()
-
-                        if ensemble_probs_5th is None:
-                            ensemble_probs_5th = model_probs_5th / len(models_5th)
-                        else:
-                            ensemble_probs_5th += model_probs_5th / len(models_5th)
-                        del model_probs_5th
-                        torch.cuda.empty_cache()
-
-                    del image_multichannel_5th
-                    pred = (ensemble_probs_5th > PRED_THRESHOLD_5TH_STAGE).astype(np.uint8)
-                    del ensemble_probs_5th
-                    torch.cuda.empty_cache()
-
-                    if iter_idx_5th < NUM_ITERATIONS_5TH_STAGE - 1:
-                        current_mask_5th = pred.astype(np.float32)
-
-                del image_normalized_5th, current_mask_5th
-                torch.cuda.empty_cache()
-
-            # ==================
-            # 6TH STAGE: DeformNet refinement
-            # ==================
-            if NUM_STAGES >= 6 and deformnet_entries:
-                print(f"      Running 6th stage (DeformNet) with {len(deformnet_entries)} model(s)...")
-                pred_deform = predict_volume_deformnet(
-                    deformnet_entries,
-                    image,
-                    pred.astype(np.float32),
-                    device=device,
-                    binarize_threshold=DEFORM_BINARIZE_THRESHOLD,
-                    final_threshold=DEFORM_FINAL_THRESHOLD,
-                    sliding_window_inferer=deform_swi,
-                    deformnet_transforms_fn=deform_tfn,
-                )
-                print(f"      DeformNet complete. Positive ratio: {pred_deform.mean():.4f}")
-                pred = pred_deform
-                del pred_deform
             torch.cuda.empty_cache()
 
         if save_dir:
@@ -1905,9 +1178,7 @@ def evaluate_fold(
         torch.cuda.empty_cache()
 
     # Clean up models
-    del models_1st, models_2nd, models_3rd, models_4th, models_5th
-    if deformnet_entries:
-        del deformnet_entries
+    del models_1st, models_2nd, models_3rd, models_4th
     torch.cuda.empty_cache()
 
 
@@ -1984,8 +1255,6 @@ def main() -> None:
     print(f"NUM_STAGES={NUM_STAGES}")
     if CACHE_3RD_STAGE_DIR:
         print(f"Mode: CACHE_3RD_STAGE – loading pre-computed 3rd stage probs from {CACHE_3RD_STAGE_DIR}")
-    elif CACHE_4TH_STAGE_DIR:
-        print(f"Mode: CACHE_4TH_STAGE – loading pre-computed 4th stage probs from {CACHE_4TH_STAGE_DIR}, running 5th refinement + DeformNet")
     elif CACHE_2ND_STAGE_DIR:
         print(f"Mode: CACHE_2ND_STAGE – loading pre-computed probs from {CACHE_2ND_STAGE_DIR}")
     else:

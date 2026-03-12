@@ -143,8 +143,7 @@ class VesuviusDataset(Dataset):
         def has_all_oofs(sample_id):
             """Check if OOF files exist for this sample in all OOF directories."""
             for oof_dir in self.oof_dirs:
-                # Support both {id}.npy and {id}_probs.npy patterns
-                if not (oof_dir / f'{sample_id}.npy').exists() and not (oof_dir / f'{sample_id}_probs.npy').exists():
+                if self._find_oof_file(oof_dir, sample_id) is None:
                     return False
             return True
 
@@ -216,14 +215,27 @@ class VesuviusDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
+    @staticmethod
+    def _find_oof_file(oof_dir, sample_id):
+        """Find OOF file for a sample, searching flat and fold subdirectories."""
+        # Flat: {oof_dir}/{sample_id}.npy or {oof_dir}/{sample_id}_probs.npy
+        for name in [f'{sample_id}.npy', f'{sample_id}_probs.npy']:
+            p = oof_dir / name
+            if p.exists():
+                return p
+        # Fold subdirs: {oof_dir}/fold_*/{sample_id}[_probs].npy
+        for fold_subdir in sorted(oof_dir.glob('fold_*')):
+            for name in [f'{sample_id}.npy', f'{sample_id}_probs.npy']:
+                p = fold_subdir / name
+                if p.exists():
+                    return p
+        return None
+
     def _get_paths(self, sample_id):
         """Get image, label, skeleton, and OOF paths for a sample."""
-        # Support both {id}.npy and {id}_probs.npy patterns for OOF files
         oof_paths = []
         for oof_dir in self.oof_dirs:
-            path = oof_dir / f'{sample_id}.npy'
-            if not path.exists():
-                path = oof_dir / f'{sample_id}_probs.npy'
+            path = self._find_oof_file(oof_dir, sample_id)
             oof_paths.append(path)
         return (self.image_dir / f'{sample_id}.npy',
                 self.label_dir / f'{sample_id}.npy',
