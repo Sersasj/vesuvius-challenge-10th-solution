@@ -4,7 +4,7 @@ set -e
 
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
 
-COMMON="--full_csv train.csv --image_dir train_images_npy --label_dir train_labels_npy --skeleton_dir train_skeletons_npy --n_folds 5 --patch_size 160 --batch_size 2 --epochs 400 --lr 1e-4 --use_amp --use_deep_supervision --deep_supervision_num 4 --loss_weights 0.4 0.4 0.1 0.1 --use_ema --ema_decay 0.999 --ema_warmup 1000 --val_interval 5 --seed 42"
+COMMON="--full_csv train.csv --image_dir train_images_npy --label_dir train_labels_npy --skeleton_dir train_skeletons_npy --n_folds 5 --patch_size 160 --batch_size 2 --epochs 400 --lr 5e-5 --use_amp --use_deep_supervision --deep_supervision_num 4 --loss_weights 0.4 0.4 0.1 0.1 --use_ema --ema_decay 0.999 --ema_warmup 1000 --val_interval 5 --seed 42"
 
 RESENCL_CKPT=$(ls pretrained_checkpoints/resencl/fold_0/best*.ckpt 2>/dev/null | head -1)
 PRIMUS_CKPT=$(ls pretrained_checkpoints/primus/fold_0/best*.ckpt 2>/dev/null | head -1)
